@@ -15,6 +15,7 @@ Pipeline
 # Imports
 # ----------------------------------------------------------------------------
 import argparse  # parses command-line arguments (filter / train / test / colorize + flags)
+import csv  # writes the per-epoch validation metrics to metrics.csv (handy for plotting in the report)
 import json  # saves and loads the train/val/test split as a JSON file
 import random  # shuffles the image list reproducibly
 from functools import partial  # lets us pass an extra fixed argument to a multiprocessing worker
@@ -34,9 +35,11 @@ from tqdm import tqdm  # progress bars
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
-DEFAULT_IMG_SIZE = 256  # the standard size every image is forced to; override with --img-size 128 / 256
+DEFAULT_IMG_SIZE = 128  # the standard size every image is forced to; override with --img-size 128 / 256
 EXTS = {".jpg", ".jpeg", ".png"}  # file extensions we treat as images
 AB_SCALE = 110.0  # a,b channels span roughly [-110, 110]; dividing by this maps them to ~[-1, 1]
+MAX_ERR = 150  # largest per-pixel color error (Lab units) tracked by the threshold-accuracy histogram
+METRIC_KEYS = ["l1", "huber", "acc@5", "acc@10", "acc@20", "auc"]  # order of the metrics in logs and metrics.csv
 
 
 # ----------------------------------------------------------------------------
@@ -53,11 +56,10 @@ def is_valid_image(path, min_side, gray_chroma=4.0, sepia_conc=0.97, sepia_chrom
     try:  # wrap everything: corrupt/unreadable files should simply be rejected
 
         img = Image.open(path).convert("RGB")  # open the file and force 3-channel RGB
-
         if min(img.size) < min_side:  # img.size is (width, height); check the shorter side
             return False  # smaller than the standard size -> would need upscaling -> reject
-        
         img.thumbnail((96, 96))  # shrink in place to <=96px; makes the color stats much faster
+
         lab = color.rgb2lab(np.asarray(img))  # convert to CIELAB -> array of shape (H, W, 3)
         a, b = lab[..., 1], lab[..., 2]  # split out the two color channels
         chroma = np.hypot(a, b)  # per-pixel colorfulness = sqrt(a^2 + b^2)
@@ -72,7 +74,6 @@ def is_valid_image(path, min_side, gray_chroma=4.0, sepia_conc=0.97, sepia_chrom
         if R > sepia_conc and chroma.mean() < sepia_chroma:  # single hue + mild saturation -> sepia tone
             return False  # reject sepia
         return True  # passed every check: it's a real color image
-
     
     except Exception:  # any error while opening/processing the file
         return False  # treat unreadable images as invalid
@@ -88,12 +89,15 @@ def cmd_filter(args):
     root = Path(args.data)  # the images folder, e.g. mirflickr/images (contains subfolders 0, 1, 2, ...)
     if not root.exists():  # catch typos in --data before doing any work
         raise SystemExit(f"Folder not found: {root}")  # stop with a clear error message
+    
     # If --parts was given (e.g. 0 1 2) search only those numbered subfolders; otherwise search everything.
     roots = [root / s for s in args.parts] if args.parts else [root]
+
     # Recursively find every image file under each search root; sorted first so the shuffle below is reproducible.
     paths = sorted(p for r in roots for p in r.rglob("*") if p.suffix.lower() in EXTS)
     random.Random(args.seed).shuffle(paths)  # shuffle so the sample is drawn from ALL subfolders
     print(f"Found {len(paths)} images in {len(roots)} location(s), filtering (min side {args.img_size}px)...")
+
     keep = []  # will hold the paths of images that pass the filter
     worker = partial(_check, min_side=args.img_size)  # fix the min_side argument for every worker call
     with Pool(args.workers) as pool:  # start a pool of worker processes
@@ -129,9 +133,11 @@ class ColorDataset(Dataset):
     def __getitem__(self, i):
         img = self.tf(Image.open(self.paths[i]).convert("RGB"))  # load image i, force RGB, apply transforms
         lab = color.rgb2lab(np.asarray(img)).astype(np.float32)  # RGB -> Lab, shape (S, S, 3), float32
+
         # L is in [0, 100]; dividing by 50 and subtracting 1 maps it to [-1, 1].
         # [..., :1] keeps a trailing channel dim of size 1; permute moves it to (1, H, W) for PyTorch.
         L = torch.from_numpy(lab[..., :1] / 50.0 - 1.0).permute(2, 0, 1)
+
         # a and b divided by 110 -> approximately [-1, 1]; result shape (2, H, W).
         ab = torch.from_numpy(lab[..., 1:] / AB_SCALE).permute(2, 0, 1)
         return L, ab  # input (grayscale info) and target (color info)
@@ -141,8 +147,10 @@ def lab_to_rgb(L, ab):
     """L: (B,1,H,W) in [-1,1], ab: (B,2,H,W) in [-1,1]  ->  (B,H,W,3) float RGB in [0,1]."""
     L = (L.detach().cpu().numpy() + 1.0) * 50.0  # undo the normalization: back to [0, 100], as numpy
     ab = ab.detach().cpu().numpy() * AB_SCALE  # undo the normalization: back to ~[-110, 110]
+
     # Stack channels into (B, 3, H, W), then move channels last -> (B, H, W, 3) as skimage expects.
     lab = np.concatenate([L, ab], axis=1).transpose(0, 2, 3, 1)
+
     # Convert each image Lab -> RGB and clip to [0, 1] (some Lab colors fall outside the RGB gamut).
     return np.stack([np.clip(color.lab2rgb(x), 0, 1) for x in lab])
 
@@ -152,11 +160,13 @@ def make_splits(list_file, n_train, n_val, n_test, seed):
     paths = [p for p in Path(list_file).read_text().splitlines() if p]  # read paths, skip blank lines
     random.Random(seed).shuffle(paths)  # seeded shuffle so splits are reproducible
     need = n_train + n_val + n_test  # total images requested
+
     if len(paths) < need:  # fewer valid images than requested?
         f = len(paths) / need  # fraction of the request we can actually satisfy
         # Shrink each split by the same fraction so the proportions stay the same.
         n_train, n_val, n_test = int(n_train * f), int(n_val * f), int(n_test * f)
         print(f"Only {len(paths)} valid images; using {n_train}/{n_val}/{n_test}")
+
     return (paths[:n_train],  # first chunk -> training
             paths[n_train:n_train + n_val],  # next chunk -> validation
             paths[n_train + n_val:n_train + n_val + n_test])  # next chunk -> test (no overlap)
@@ -184,12 +194,14 @@ class Up(nn.Module):
 
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()  # initialize the nn.Module machinery
+
         # After concatenation the channel count is in_c + skip_c; the block reduces it to out_c.
         self.conv = ConvBlock(in_c + skip_c, out_c)
 
     def forward(self, x, skip):
         # Enlarge x to the exact spatial size of the skip feature map (bilinear interpolation).
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+
         # Glue decoder features and encoder features together along the channel axis, then convolve.
         return self.conv(torch.cat([x, skip], dim=1))
 
@@ -199,15 +211,20 @@ class ResNetUNet(nn.Module):
 
     def __init__(self, pretrained=True):
         super().__init__()  # initialize nn.Module
+
         # Load ResNet34; use ImageNet weights if pretrained=True, otherwise random init (used at test time,
         # because the checkpoint will overwrite the weights anyway).
         r = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
+
         # Original conv1 takes 3 channels (RGB). We need 1 channel (L), so make a new 1-channel conv...
         self.conv1 = nn.Conv2d(1, 64, 7, 2, 3, bias=False)  # 7x7 kernel, stride 2, padding 3, like ResNet
+
         # ...and initialize it with the RGB filters summed into one channel (keeps pretrained knowledge).
         self.conv1.weight.data.copy_(r.conv1.weight.data.sum(dim=1, keepdim=True))
+
         # Reuse the pretrained batch norm, ReLU and max-pool layers from ResNet unchanged.
         self.bn1, self.relu, self.maxpool = r.bn1, r.relu, r.maxpool
+
         # Reuse the four pretrained residual stages: these form the encoder.
         self.layer1, self.layer2, self.layer3, self.layer4 = r.layer1, r.layer2, r.layer3, r.layer4
 
@@ -215,6 +232,7 @@ class ResNetUNet(nn.Module):
         self.up3 = Up(256, 128, 128)  # decoder: 256ch + skip x2 (128ch @1/8) -> 128ch
         self.up2 = Up(128, 64, 64)  # decoder: 128ch + skip x1 (64ch @1/4) -> 64ch
         self.up1 = Up(64, 64, 64)  # decoder: 64ch + skip x0 (64ch @1/2) -> 64ch
+
         # Head: also sees the original L (64+1 channels) at full resolution, refines to 32 channels,
         # 1x1 conv gives the 2 output channels (a, b), tanh squashes to [-1, 1] to match the targets.
         self.head = nn.Sequential(ConvBlock(64 + 1, 32), nn.Conv2d(32, 2, 1), nn.Tanh())
@@ -229,8 +247,10 @@ class ResNetUNet(nn.Module):
         d = self.up3(d, x2)  # upsample, merge with x2
         d = self.up2(d, x1)  # upsample, merge with x1
         d = self.up1(d, x0)  # upsample, merge with x0 (back to 1/2 resolution)
+
         # Upsample the last 1/2-resolution features to the full input size.
         d = F.interpolate(d, size=L.shape[-2:], mode="bilinear", align_corners=False)
+
         # Append the raw L channel (sharp detail) and predict the final 2 color channels.
         return self.head(torch.cat([d, L], dim=1))
 
@@ -242,6 +262,7 @@ class PatchDiscriminator(nn.Module):
         super().__init__()  # initialize nn.Module
 
         def blk(i, o, stride, norm=True):
+
             # One discriminator block: 4x4 conv (+ optional batch norm) + LeakyReLU.
             layers = [nn.Conv2d(i, o, 4, stride, 1, bias=not norm)]  # skip bias when BN follows
             if norm:  # the very first block conventionally has no normalization
@@ -270,17 +291,58 @@ def pixel_losses(pred, ab):
     return l1, huber  # both are tracked; training minimizes their sum
 
 
+class ColorMetrics:
+    """Accumulates regression metrics over many batches.
+
+    L1 / Huber        : average error on the normalized a,b channels (the training objective).
+    Threshold accuracy: share of pixels whose color error (Euclidean distance in a,b, in Lab units)
+                        is under 5/10/20 units, plus AuC over thresholds 1..150
+                        (the metric used by Zhang et al., Colorful Image Colorization).
+    """
+
+    def __init__(self, dev):
+        # Histogram of per-pixel color error; bucket k counts pixels with error in [k, k+1) Lab units.
+        self.err_hist = torch.zeros(MAX_ERR + 1, dtype=torch.long, device=dev)
+        self.l1_sum, self.hub_sum, self.n = 0.0, 0.0, 0  # running loss totals and number of images seen
+
+    def update(self, pred, ab):
+        """Add one batch: pred and ab are (B,2,H,W) tensors normalized to ~[-1, 1]."""
+        l1, hub = pixel_losses(pred, ab)  # batch-average L1 and Huber
+        self.l1_sum += l1.item() * len(ab)  # weight by batch size so the last small batch counts fairly
+        self.hub_sum += hub.item() * len(ab)  # same for Huber
+        self.n += len(ab)  # count images
+        err = torch.linalg.vector_norm((pred - ab) * AB_SCALE, dim=1)  # per-pixel color distance in Lab units
+        
+        # Floor each error to an integer bucket (anything above MAX_ERR goes in the last bucket) and count them.
+        self.err_hist += torch.bincount(err.long().clamp(max=MAX_ERR).flatten(), minlength=MAX_ERR + 1)
+
+    def compute(self):
+        """Turn the accumulated counts into a dict of plain floats (keys listed in METRIC_KEYS)."""
+        cum = self.err_hist.cumsum(0).double() / self.err_hist.sum().clamp(min=1)  # cumulative error distribution
+        return {
+            "l1": self.l1_sum / self.n,  # mean absolute error in normalized units
+            "huber": self.hub_sum / self.n,  # mean Huber loss
+            "acc@5": cum[4].item(),  # share of pixels with color error below 5 Lab units
+            "acc@10": cum[9].item(),  # share below 10 Lab units
+            "acc@20": cum[19].item(),  # share below 20 Lab units
+            "auc": cum[:MAX_ERR].mean().item(),  # area under the cumulative error curve over thresholds 1..150
+        }
+
+
+def format_metrics(m):
+    """One-line human-readable summary of a metrics dict."""
+    return (f"L1 {m['l1']:.4f} (~{m['l1'] * AB_SCALE:.2f} Lab) | Huber {m['huber']:.4f} | "
+            f"within 5/10/20: {m['acc@5']:.3f}/{m['acc@10']:.3f}/{m['acc@20']:.3f}  AuC {m['auc']:.3f}")
+
+
 @torch.no_grad()  # no gradients needed during validation -> saves memory and time
 def validate(G, loader, dev):
     G.eval()  # eval mode: batch norm uses running stats, no training behavior
-    n, l1_sum, hub_sum = 0, 0.0, 0.0  # running totals: sample count and summed losses
+    mt = ColorMetrics(dev)  # fresh accumulator for this validation pass
     for L, ab in loader:  # iterate over validation batches
         L, ab = L.to(dev), ab.to(dev)  # move the batch to the GPU/CPU device
-        l1, hub = pixel_losses(G(L), ab)  # predict colors and compute both losses
-        l1_sum += l1.item() * len(L)  # weight by batch size (last batch may be smaller)
-        hub_sum += hub.item() * len(L)  # same for Huber
-        n += len(L)  # count samples seen
-    return l1_sum / n, hub_sum / n  # dataset-wide average of each loss
+        mt.update(G(L), ab)  # predict colors and add this batch to every metric
+    return mt.compute()  # dict of dataset-wide metrics
 
 
 @torch.no_grad()  # no gradients needed when just making pictures
@@ -296,6 +358,45 @@ def save_samples(G, loader, dev, path, n=8):
     rows = [np.concatenate(list(x), axis=1) for x in (gray, fake, real)]
     # Stack the three rows vertically, scale to 0-255 bytes, and save as a PNG grid.
     Image.fromarray((np.concatenate(rows, axis=0) * 255).astype(np.uint8)).save(path)
+
+
+def plot_history(csv_path, png_path):
+    """Read metrics.csv and save a two-panel figure: loss and threshold accuracy per epoch, one line per split."""
+    import matplotlib  # imported here so the rest of the script still works if matplotlib is missing
+    matplotlib.use("Agg")  # draw straight to a file instead of opening a window
+    import matplotlib.pyplot as plt  # the plotting API
+    with open(csv_path, newline="") as fh:  # open the metrics log
+        rows = list(csv.DictReader(fh))  # each row becomes a dict keyed by column name
+    fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 4.5))  # two side-by-side panels
+    names = {"train": "Training", "val": "Validation", "test": "Test"}  # legend labels for each split
+    for split in ("train", "val", "test"):  # draw the splits in a fixed order so colors stay consistent
+        rs = [r for r in rows if r["split"] == split]  # this split's rows, one per epoch
+        if not rs:  # e.g. no test rows when --no-test-curve was used
+            continue  # nothing to draw for this split
+        epochs = [int(r["epoch"]) for r in rs]  # x values
+        loss = [float(r["l1"]) + float(r["huber"]) for r in rs]  # pixel loss that training minimizes (L1 + Huber)
+        acc = [float(r["acc@10"]) for r in rs]  # share of pixels with color error under 10 Lab units
+        ax_loss.plot(epochs, loss, marker="o", label=names[split])  # loss curve for this split
+        ax_acc.plot(epochs, acc, marker="o", label=names[split])  # accuracy curve for this split
+    ax_loss.set_title("Loss (L1 + Huber) per epoch")  # left panel title
+    ax_loss.set_ylabel("Loss")  # left panel y-axis label
+    ax_acc.set_title("Accuracy: pixels within 10 Lab units of the true color")  # right panel title
+    ax_acc.set_ylabel("Share of pixels")  # right panel y-axis label
+    for ax in (ax_loss, ax_acc):  # settings shared by both panels
+        ax.set_xlabel("Epoch")  # x-axis label
+        ax.grid(alpha=0.3)  # light grid for readability
+        ax.legend()  # show which line is which split
+    fig.tight_layout()  # avoid overlapping labels
+    fig.savefig(png_path, dpi=150)  # write the PNG
+    plt.close(fig)  # free the figure's memory (matters when called every epoch)
+
+
+def cmd_plot(args):
+    """`plot` subcommand: redraw the curves from an existing metrics.csv without retraining."""
+    csv_path = Path(args.csv)  # the log written during training
+    png_path = Path(args.out) if args.out else csv_path.parent / "training_curves.png"  # default: next to the csv
+    plot_history(csv_path, png_path)  # draw and save
+    print("saved", png_path)  # confirm to the user
 
 
 def cmd_train(args):
@@ -316,6 +417,9 @@ def cmd_train(args):
                                      shuffle=train, num_workers=args.workers,
                                      pin_memory=dev.type == "cuda", drop_last=train)
     train_dl, val_dl = mk(tr, True), mk(va, False)  # training loader (augmented) and validation loader
+    # Optional loader for the held-out test split so its curve can be plotted each epoch.
+    # It is only for monitoring: best.pt is still chosen by validation L1, never by test results.
+    test_dl = mk(te, False) if (args.track_test and te) else None
 
     G = ResNetUNet(pretrained=True).to(dev)  # the generator / colorizer, with pretrained encoder
     # Adam optimizer; beta1=0.5 is the usual GAN setting and works fine for plain training too.
@@ -326,12 +430,16 @@ def cmd_train(args):
         bce = nn.BCEWithLogitsLoss()  # real/fake classification loss (sigmoid built in)
 
     best = float("inf")  # lowest validation L1 seen so far
+    with open(out / "metrics.csv", "w", newline="") as fh:  # start a fresh per-epoch metrics log
+        csv.writer(fh).writerow(["epoch", "split"] + METRIC_KEYS)  # header: epoch, split (train/val/test), l1, ...
     for epoch in range(1, args.epochs + 1):  # one pass over the training set per epoch
         G.train()  # training mode (batch norm updates its statistics)
+        tr_mt = ColorMetrics(dev)  # fresh accumulator for this epoch's training-set metrics
         bar = tqdm(train_dl, desc=f"epoch {epoch}/{args.epochs}")  # progress bar wrapping the loader
         for L, ab in bar:  # iterate over training batches
             L, ab = L.to(dev), ab.to(dev)  # move batch to the device
             pred = G(L)  # forward pass: predict (a, b) from L
+            tr_mt.update(pred.detach(), ab)  # record training metrics (detach: no gradients needed for tracking)
 
             if args.gan:  # --- discriminator step ---
                 real_logits = D(L, ab)  # D's opinion of the real color image
@@ -357,8 +465,22 @@ def cmd_train(args):
             optG.step()  # update the generator's weights
             bar.set_postfix(msg)  # display current losses on the progress bar
 
-        val_l1, val_hub = validate(G, val_dl, dev)  # evaluate on the validation set after each epoch
-        print(f"  val L1 {val_l1:.4f} (~{val_l1 * AB_SCALE:.2f} Lab units)  val Huber {val_hub:.4f}")
+        m_train = tr_mt.compute()  # training metrics averaged over this epoch's batches (augmented, weights changing)
+        m = validate(G, val_dl, dev)  # evaluate on the validation set after each epoch (dict of metrics)
+        val_l1 = m["l1"]  # model selection still uses validation L1
+        results = [("train", m_train), ("val", m)]  # (split name, metrics) pairs to report and log
+        if test_dl is not None:  # only if test-curve tracking is on (default)
+            results.append(("test", validate(G, test_dl, dev)))  # monitor the test split; never used for selection
+        for name, mm in results:  # print one summary line per split
+            print(f"  {name:5s} {format_metrics(mm)}")
+        with open(out / "metrics.csv", "a", newline="") as fh:  # append this epoch's rows to the log
+            w = csv.writer(fh)  # csv writer for the open file
+            for name, mm in results:  # one row per split
+                w.writerow([epoch, name] + [f"{mm[k]:.6f}" for k in METRIC_KEYS])
+        try:  # redraw the curves every epoch so you can watch training progress
+            plot_history(out / "metrics.csv", out / "training_curves.png")
+        except ImportError:  # matplotlib isn't installed
+            print("  (matplotlib not installed - skipping plot; run: pip install matplotlib)")
         save_samples(G, val_dl, dev, out / f"samples_epoch{epoch:02d}.png")  # visual check of quality
         ckpt = {"model": G.state_dict(), "epoch": epoch, "img_size": args.img_size}  # weights + size they expect
         torch.save(ckpt, out / "last.pt")  # always save the latest weights
@@ -392,19 +514,22 @@ def cmd_test(args):
     dl = DataLoader(ColorDataset(test_paths, False, img_size), batch_size=args.batch_size,
                     num_workers=args.workers)  # no augmentation for testing
 
-    l1s, hubs, psnrs = [], [], []  # per-batch (or per-image for PSNR) metric lists
+    mt = ColorMetrics(dev)  # accumulator for the regression, classification and threshold metrics
+    psnrs = []  # PSNR is computed per image in RGB space, so it gets its own list
     for L, ab in tqdm(dl, desc="test"):  # iterate over test batches
         L, ab = L.to(dev), ab.to(dev)  # move to device
         pred = G(L)  # predict colors
-        l1, hub = pixel_losses(pred, ab)  # pixel losses on the batch
-        l1s.append(l1.item()); hubs.append(hub.item())  # record them
+        mt.update(pred, ab)  # add this batch to every metric
         # Convert predicted and true images to RGB and compare each pair with PSNR.
         for f, r in zip(lab_to_rgb(L, pred), lab_to_rgb(L, ab)):
             psnrs.append(psnr(r, f, data_range=1.0))  # reference first, then estimate; pixels span [0, 1]
+    m = mt.compute()  # finalize the metrics into a dict
     print(f"Test images: {len(test_paths)} at {img_size}x{img_size}")  # how many images were evaluated
-    print(f"L1 (normalized): {np.mean(l1s):.4f}  (~{np.mean(l1s) * AB_SCALE:.2f} Lab a/b units)")  # avg L1
-    print(f"Huber:           {np.mean(hubs):.4f}")  # avg Huber
-    print(f"RGB PSNR:        {np.mean(psnrs):.2f} dB")  # avg PSNR
+    print(f"L1 (normalized):  {m['l1']:.4f}  (~{m['l1'] * AB_SCALE:.2f} Lab a/b units)")  # mean absolute error
+    print(f"Huber:            {m['huber']:.4f}")  # mean Huber loss
+    print(f"Pixels within 5/10/20 Lab units: {m['acc@5']:.4f} / {m['acc@10']:.4f} / {m['acc@20']:.4f}")  # threshold acc
+    print(f"AuC (thresholds 1-150): {m['auc']:.4f}")  # Zhang et al. style summary
+    print(f"RGB PSNR:         {np.mean(psnrs):.2f} dB")  # avg PSNR
 
 
 # ----------------------------------------------------------------------------
@@ -473,7 +598,14 @@ def main():
     t.add_argument("--lr", type=float, default=2e-4)  # Adam learning rate
     t.add_argument("--gan", action="store_true", help="train U-Net as GAN generator (adds adversarial loss)")  # flag
     t.add_argument("--lambda-pix", type=float, default=100.0, help="weight of L1+Huber when --gan")  # GAN balance
+    # Test curve is on by default; this flag turns it off (saves a little time per epoch).
+    t.add_argument("--no-test-curve", dest="track_test", action="store_false", help="don't evaluate the test split each epoch")
     t.set_defaults(fn=cmd_train)  # handler for `train`
+
+    pl = sub.add_parser("plot")  # `python colorize.py plot ...`  (redraw the curves from a saved log)
+    pl.add_argument("--csv", required=True)  # path to metrics.csv from a training run
+    pl.add_argument("--out", default=None)  # where to save the PNG (default: training_curves.png beside the csv)
+    pl.set_defaults(fn=cmd_plot)  # handler for `plot`
 
     e = sub.add_parser("test")  # `python colorize.py test ...`
     add_data_args(e)  # attach the shared data arguments

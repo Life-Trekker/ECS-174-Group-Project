@@ -1,0 +1,6 @@
+Test images: 100 at 128x128
+L1 (normalized):  0.1037  (~11.40 Lab a/b units)
+Huber:            0.0067
+Pixels within 5/10/20 Lab units: 0.0966 / 0.3198 / 0.6801
+AuC (thresholds 1-150): 0.8818
+RGB PSNR:         21.59 dB
